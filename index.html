@@ -244,28 +244,34 @@
     user-select: none;
     box-shadow: 3px 3px 0 var(--ink);
     transform: rotate(var(--rot, 0deg));
-    transition: background .1s ease, transform .08s ease, box-shadow .08s ease;
+    transition: background .1s ease, transform .08s ease, box-shadow .08s ease, filter .1s ease;
   }
 
-  .cell:hover:not(.found){
-    background: var(--cell-hover);
+  /* ---- Colourful cell palette (assigned randomly, re-rolled on reshuffle) ---- */
+  .cell-c1{ background: #FFD166; }
+  .cell-c2{ background: #FF9F1C; }
+  .cell-c3{ background: #4EE0B0; }
+  .cell-c4{ background: #4EA8DE; }
+  .cell-c5{ background: #C77DFF; }
+  .cell-c6{ background: #FF7EA8; }
+  .cell-c7{ background: #B9FBC0; }
+  .cell-c8{ background: #FFADAD; }
+
+  .cell:hover:not(.correct-flash){
+    filter: brightness(1.08);
     animation: wobbleHover .5s ease-in-out infinite;
   }
 
-  .cell:active:not(.found){
+  .cell:active:not(.correct-flash){
     transform: translate(3px,3px) rotate(var(--rot, 0deg));
     box-shadow: 0 0 0 var(--ink);
   }
 
-  .cell.found{
-    background: var(--correct);
+  .cell.correct-flash{
+    background: var(--correct) !important;
     color: #fff;
     -webkit-text-stroke: 1px var(--ink);
-    cursor: default;
     box-shadow: 3px 3px 0 var(--ink);
-  }
-
-  .cell.bounce-correct{
     animation: bounceCorrect .5s cubic-bezier(.36,1.6,.6,1);
   }
 
@@ -421,6 +427,18 @@
   }
   .lb-rank{ font-family:'IBM Plex Mono', monospace; color: var(--muted); width: 20px; flex-shrink:0; }
   .lb-name{ flex: 1; overflow:hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lb-progress{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    background: rgba(0,0,0,0.06);
+    border-radius: 8px;
+    padding: 2px 7px;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .lb-progress-full{ color: var(--correct-dark); background: rgba(31,158,91,0.15); }
   .lb-time{ font-family:'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
 
   .confetti{
@@ -454,7 +472,7 @@
   }
 
   @media (prefers-reduced-motion: reduce){
-    .cell, .cell:hover, .cell.bounce-correct, .cell.shake-error, .win-banner.show{
+    .cell, .cell:hover, .cell.correct-flash, .cell.shake-error, .win-banner.show{
       animation: none !important;
       transition: none !important;
     }
@@ -474,7 +492,7 @@
   <div class="header">
     <p class="eyebrow">Peripheral Vision Drill</p>
     <h1>Schulte Table</h1>
-    <p class="subtitle">Fix your eyes near the centre. Find 1 → N in order, using peripheral vision only. Dynamic mode reshuffles the remaining numbers after every click.</p>
+    <p class="subtitle">The target jumps around, not in order — sometimes 1, then 7, then 3. The board can reshuffle after every click, so no cell is ever "done": you can't just memorise a spot.</p>
   </div>
 
   <div class="panel">
@@ -498,6 +516,7 @@
       <div class="field">
         <label for="livesSelect">Lives</label>
         <select id="livesSelect">
+          <option value="1">1 Life (Hardcore)</option>
           <option value="3" selected>3 Lives</option>
           <option value="5">5 Lives</option>
         </select>
@@ -568,9 +587,24 @@
   const NAME_KEY = 'schulte_player_name_v1';
   const MAX_ENTRIES = 5;
 
+  /* Fail-safe storage: falls back to an in-memory store if localStorage
+     is unavailable or blocked (e.g. inside a sandboxed preview), so the
+     game and leaderboard still work for the current session either way. */
+  const memoryStore = {};
+  function storageGet(key){
+    try{ return localStorage.getItem(key); }
+    catch(e){ return Object.prototype.hasOwnProperty.call(memoryStore, key) ? memoryStore[key] : null; }
+  }
+  function storageSet(key, value){
+    try{ localStorage.setItem(key, value); }
+    catch(e){ memoryStore[key] = value; }
+  }
+
   let size = 5;
   let total = size * size;
-  let current = 1;
+  let sequence = [];
+  let seqIndex = 0;
+  let target = null;
   let startTime = null;
   let timerRAF = null;
   let running = false;
@@ -579,9 +613,9 @@
   let maxLives = 3;
   let lives = 3;
 
-  playerNameInput.value = localStorage.getItem(NAME_KEY) || '';
+  playerNameInput.value = storageGet(NAME_KEY) || '';
   playerNameInput.addEventListener('change', () => {
-    localStorage.setItem(NAME_KEY, playerNameInput.value.trim());
+    storageSet(NAME_KEY, playerNameInput.value.trim());
   });
   function getPlayerName(){
     const n = playerNameInput.value.trim();
@@ -652,26 +686,57 @@
     playTone(140, 0.28, 0.3, 'sawtooth', 0.18);
   }
 
-  /* ---------------- Local storage leaderboard ---------------- */
-  function loadLeaderboard(){
-    try{ return JSON.parse(localStorage.getItem(LEADERBOARD_KEY)) || {}; }
-    catch(e){ return {}; }
+  /* ---------------- Leaderboard (uses fail-safe storage above) ---------------- */
+  function normalizeEntry(sz, s){
+    const totalForSize = Number(sz) * Number(sz);
+    return {
+      name: s.name,
+      timeMs: s.timeMs,
+      correct: s.correct != null ? s.correct : totalForSize,
+      total: s.total != null ? s.total : totalForSize,
+      completed: s.completed != null ? s.completed : true
+    };
   }
-  function saveLeaderboard(data){ localStorage.setItem(LEADERBOARD_KEY, JSON.stringify(data)); }
+
+  function loadLeaderboard(){
+    try{
+      const raw = JSON.parse(storageGet(LEADERBOARD_KEY)) || {};
+      const normalized = {};
+      Object.keys(raw).forEach(sz => {
+        normalized[sz] = (raw[sz] || []).map(s => normalizeEntry(sz, s));
+      });
+      return normalized;
+    } catch(e){ return {}; }
+  }
+  function saveLeaderboard(data){ storageSet(LEADERBOARD_KEY, JSON.stringify(data)); }
+
+  function compareScores(a, b){
+    if (!!a.completed !== !!b.completed) return a.completed ? -1 : 1;
+    if (a.completed) return a.timeMs - b.timeMs;
+    if (b.correct !== a.correct) return b.correct - a.correct;
+    return a.timeMs - b.timeMs;
+  }
 
   function getScores(sz){
     const lb = loadLeaderboard();
     return lb[sz] || [];
   }
 
-  function addScore(sz, name, timeMs){
-    const lb = loadLeaderboard();
-    const list = lb[sz] || [];
-    list.push({ name, timeMs });
-    list.sort((a, b) => a.timeMs - b.timeMs);
-    lb[sz] = list.slice(0, MAX_ENTRIES);
-    saveLeaderboard(lb);
-    return lb[sz];
+  function addScore(sz, name, timeMs, correct, total, completed){
+    const entry = { name, timeMs, correct, total, completed };
+    try{
+      const lb = loadLeaderboard();
+      const list = lb[sz] || [];
+      list.push(entry);
+      list.sort(compareScores);
+      lb[sz] = list.slice(0, MAX_ENTRIES);
+      saveLeaderboard(lb);
+      return lb[sz];
+    } catch(e){
+      // Never let a storage hiccup break the win/loss screen —
+      // just show this run's score for the current session.
+      return [entry];
+    }
   }
 
   function formatTime(ms){
@@ -691,14 +756,20 @@
     return arr;
   }
 
+  const COLOR_COUNT = 8;
+  function setRandomColor(cell){
+    cell.className = cell.className.replace(/\bcell-c\d\b/g, '').trim();
+    cell.classList.add('cell-c' + (1 + Math.floor(Math.random() * COLOR_COUNT)));
+  }
+
   function fontSizeForSize(n){
     const map = { 3: 'clamp(30px, 9.5vw, 46px)', 4: 'clamp(25px, 7.5vw, 38px)', 5: 'clamp(19px, 5.6vw, 29px)', 6: 'clamp(16px, 4.6vw, 23px)' };
     return map[n] || map[5];
   }
 
   function updateBestDisplay(){
-    const scores = getScores(size);
-    bestDisplay.textContent = scores.length ? formatTime(scores[0].timeMs) : '—:—.—';
+    const completed = getScores(size).find(s => s.completed);
+    bestDisplay.textContent = completed ? formatTime(completed.timeMs) : '—:—.—';
   }
 
   function renderLeaderboard(){
@@ -721,11 +792,15 @@
       const name = document.createElement('span');
       name.className = 'lb-name';
       name.textContent = s.name;
+      const progress = document.createElement('span');
+      progress.className = 'lb-progress' + (s.completed ? ' lb-progress-full' : '');
+      progress.textContent = s.correct + '/' + s.total;
       const time = document.createElement('span');
       time.className = 'lb-time';
       time.textContent = formatTime(s.timeMs);
       li.appendChild(rank);
       li.appendChild(name);
+      li.appendChild(progress);
       li.appendChild(time);
       lbList.appendChild(li);
     });
@@ -766,7 +841,9 @@
   function buildGrid(){
     size = parseInt(gridSizeSel.value, 10);
     total = size * size;
-    current = 1;
+    sequence = shuffle(Array.from({length: total}, (_, i) => i + 1));
+    seqIndex = 0;
+    target = sequence[0];
     startTime = null;
     running = false;
     finished = false;
@@ -774,7 +851,7 @@
     lives = maxLives;
     cancelAnimationFrame(timerRAF);
     timeDisplay.textContent = formatTime(0);
-    nextDisplay.textContent = '1';
+    nextDisplay.textContent = String(target);
     winBanner.classList.remove('show', 'lose');
     updateBestDisplay();
     renderHearts();
@@ -797,6 +874,7 @@
       cell.style.setProperty('--rot', rot);
       cell.dataset.value = num;
       cell.tabIndex = 0;
+      setRandomColor(cell);
       cell.addEventListener('click', () => handleCellClick(cell));
       cell.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' '){
@@ -816,14 +894,14 @@
     timerRAF = requestAnimationFrame(tick);
   }
 
-  function reshuffleRemaining(){
-    const remaining = cellEls.filter(c => !c.classList.contains('found'));
-    if (remaining.length < 2) return;
-    const values = remaining.map(c => c.dataset.value);
+  function reshuffleAll(){
+    if (cellEls.length < 2) return;
+    const values = cellEls.map(c => c.dataset.value);
     shuffle(values);
-    remaining.forEach((c, i) => {
+    cellEls.forEach((c, i) => {
       c.dataset.value = values[i];
       c.textContent = values[i];
+      setRandomColor(c);
       c.classList.remove('reshuffle-pop');
       void c.offsetWidth; // restart animation
       c.classList.add('reshuffle-pop');
@@ -841,13 +919,13 @@
       timerRAF = requestAnimationFrame(tick);
     }
 
-    if (num === current){
+    if (num === target){
       playCorrectSound();
-      cell.classList.add('found', 'bounce-correct');
-      setTimeout(() => cell.classList.remove('bounce-correct'), 500);
-      current += 1;
+      cell.classList.add('correct-flash');
+      setTimeout(() => cell.classList.remove('correct-flash'), 500);
+      seqIndex += 1;
 
-      if (current > total){
+      if (seqIndex >= total){
         finished = true;
         running = false;
         cancelAnimationFrame(timerRAF);
@@ -855,8 +933,8 @@
         timeDisplay.textContent = formatTime(finalElapsed);
         nextDisplay.textContent = '✓';
 
-        const scores = addScore(size, getPlayerName(), finalElapsed);
-        const isTopScore = scores.length && scores[0].timeMs === finalElapsed;
+        const scores = addScore(size, getPlayerName(), finalElapsed, total, total, true);
+        const isTopScore = scores.length && scores[0].completed && scores[0].timeMs === finalElapsed;
         winBanner.textContent = isTopScore ? 'New high score!' : 'Run complete';
         winBanner.classList.remove('lose');
         winBanner.classList.add('show');
@@ -865,11 +943,11 @@
         playWinSound();
         spawnConfetti();
       } else {
-        nextDisplay.textContent = String(current);
-        if (dynamicToggle.checked) reshuffleRemaining();
+        target = sequence[seqIndex];
+        nextDisplay.textContent = String(target);
+        if (dynamicToggle.checked) reshuffleAll();
       }
     } else {
-      if (cell.classList.contains('found')) return;
       playErrorSound();
       cell.classList.remove('shake-error');
       void cell.offsetWidth; // restart animation
@@ -894,12 +972,18 @@
     finished = true;
     running = false;
     cancelAnimationFrame(timerRAF);
+    const finalElapsed = startTime != null ? performance.now() - startTime : 0;
+    timeDisplay.textContent = formatTime(finalElapsed);
     nextDisplay.textContent = '✕';
-    winBanner.textContent = 'Out of lives — try again!';
+    winBanner.textContent = 'Out of lives — try again! (' + seqIndex + '/' + total + ' found)';
     winBanner.classList.remove('show', 'lose');
     void winBanner.offsetWidth;
     winBanner.classList.add('show', 'lose');
     playLoseSound();
+
+    addScore(size, getPlayerName(), finalElapsed, seqIndex, total, false);
+    updateBestDisplay();
+    renderLeaderboard();
   }
 
   gridSizeSel.addEventListener('change', () => { playTickSound(); buildGrid(); });
